@@ -396,7 +396,7 @@ async def ocr_worker():
             print(f'[worker] job {job_id} iniciado ({job["filename"]})', flush=True)
             started = time.time()
             try:
-                img = Image.open(job['"imagePath"'])
+                img = Image.open(job['imagePath'])
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                 result = await asyncio.to_thread(process_image_full, img)
