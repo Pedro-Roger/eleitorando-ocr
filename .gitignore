@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+jobs_images/
+main.py.bak
+.env
+.DS_Store
