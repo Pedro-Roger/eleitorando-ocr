@@ -342,9 +342,27 @@ _load_env()
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 
 # banco da fila de jobs (mesmo Postgres da aplicação)
-DB_DSN = os.environ.get('DATABASE_URL', 'postgresql://pedroroger@localhost:5432/sistema_eleitoral')
-# remove "?schema=public" (parâmetro do Prisma, inválido para psycopg2)
-DB_DSN = DB_DSN.split('?')[0]
+def _sanitize_dsn(dsn):
+    """Remove query params (ex.: ?schema=public do Prisma) e re-encoda a
+    senha — libpq (psycopg2) não tolera caracteres especiais como '@'."""
+    dsn = (dsn or '').split('?')[0]
+    try:
+        from urllib.parse import urlsplit, urlunsplit, quote
+        p = urlsplit(dsn)
+        host = p.hostname or ''
+        if p.port:
+            host += f':{p.port}'
+        cred = ''
+        if p.username:
+            cred = quote(p.username, safe='')
+            if p.password:
+                cred += ':' + quote(p.password, safe='')
+            cred += '@'
+        return urlunsplit((p.scheme, cred + host, p.path, '', ''))
+    except Exception:
+        return dsn
+
+DB_DSN = _sanitize_dsn(os.environ.get('DATABASE_URL') or 'postgresql://pedroroger@localhost:5432/sistema_eleitoral')
 JOBS_DIR = os.path.join(os.path.dirname(__file__), 'jobs_images')
 os.makedirs(JOBS_DIR, exist_ok=True)
 
