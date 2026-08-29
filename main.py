@@ -382,7 +382,7 @@ async def ocr_worker():
             cur.execute(
                 "UPDATE ocr_jobs SET status = 'processing' "
                 'WHERE id = (SELECT id FROM ocr_jobs WHERE status = %s ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) '
-                'RETURNING id, image_path, filename',
+                'RETURNING id, "imagePath", filename',
                 ('queued',),
             )
             job = cur.fetchone()
@@ -396,14 +396,14 @@ async def ocr_worker():
             print(f'[worker] job {job_id} iniciado ({job["filename"]})', flush=True)
             started = time.time()
             try:
-                img = Image.open(job['image_path'])
+                img = Image.open(job['"imagePath"'])
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                 result = await asyncio.to_thread(process_image_full, img)
                 conn = db()
                 cur = conn.cursor()
                 cur.execute(
-                    'UPDATE ocr_jobs SET status = %s, result = %s, finished_at = now() WHERE id = %s',
+                    'UPDATE ocr_jobs SET status = %s, result = %s, "finishedAt" = now() WHERE id = %s',
                     ('done', _json.dumps(result), job_id),
                 )
                 conn.commit()
@@ -415,7 +415,7 @@ async def ocr_worker():
                 conn = db()
                 cur = conn.cursor()
                 cur.execute(
-                    'UPDATE ocr_jobs SET status = %s, error = %s, finished_at = now() WHERE id = %s',
+                    'UPDATE ocr_jobs SET status = %s, error = %s, "finishedAt" = now() WHERE id = %s',
                     ('error', repr(exc)[:500], job_id),
                 )
                 conn.commit()
@@ -761,7 +761,7 @@ async def create_job(file: UploadFile = File(...), createdby: int = 0, createdby
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        'INSERT INTO ocr_jobs (status, created_by, created_by_name, filename, image_path) '
+        'INSERT INTO ocr_jobs (status, "createdBy", "createdByName", filename, "imagePath") '
         'VALUES (%s, %s, %s, %s, %s) RETURNING id',
         ('queued', createdby or None, createdbyname or None, file.filename, path),
     )
@@ -795,7 +795,7 @@ async def list_jobs(limit: int = 50):
     """Log/auditoria dos últimos jobs."""
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('SELECT id, status, created_by_name, filename, error, created_at, finished_at '
+    cur.execute('SELECT id, status, "createdByName", filename, error, "createdAt", "finishedAt" '
                 'FROM ocr_jobs ORDER BY id DESC LIMIT %s', (limit,))
     rows = cur.fetchall()
     cur.close()
