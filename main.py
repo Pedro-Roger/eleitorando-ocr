@@ -619,6 +619,22 @@ def ai_extract_list(img):
         return []
 
 
+def quick_list_check(img):
+    """Detecção barata de caderneta: OCR em resolução reduzida (max 900px,
+    ~3x mais rápido que a passada completa) só pra achar os rótulos
+    Nome:/Telefone:/Título repetidos. Evita pagar OCR full-res só pra
+    descobrir que a foto é uma lista."""
+    try:
+        w, h = img.size
+        scale = 900 / max(w, h)
+        small = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS) if scale < 1 else img
+        dets = reader.readtext(np.array(small), detail=1, paragraph=False)
+        text = '\n'.join(t for _, t in dets)
+        return looks_like_voter_list(text)
+    except Exception:
+        return False
+
+
 def process_image_full(img):
     # normaliza SEMPRE pra 1600px no maior lado (upscale também):
     # imagens pequenas têm texto pequeno demais pro OCR
@@ -627,6 +643,20 @@ def process_image_full(img):
     scale = max_side / max(w, h)
     if abs(scale - 1.0) > 0.05:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # === atalho: caderneta detectada na passada rápida → IA direto ===
+    # (pula o OCR full-res + ângulos + re-OCR regional, que é o que demora)
+    if OPENROUTER_API_KEY:
+        quick_txt = '\n'.join(
+            t for _, t, _ in reader.readtext(
+                np.array(img.resize((img.width // 2, img.height // 2), Image.LANCZOS)),
+                detail=1, paragraph=False,
+            )
+        )
+        if looks_like_voter_list(quick_txt):
+            voters = ai_extract_list(img)
+            if voters:
+                return {'type': 'lista', 'voters': voters, 'rawText': quick_txt, 'aiUsed': True}
 
     def run_ocr(angle):
         rotated = img.rotate(angle, expand=True, fillcolor=(255, 255, 255))
