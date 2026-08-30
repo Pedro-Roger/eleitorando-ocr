@@ -529,6 +529,9 @@ def ai_extract_list(img):
         "Responda APENAS um JSON válido, sem texto extra, no formato:\n"
         '{"voters": [{"nome": "", "telefone": "somente dígitos", "titleNumber": "somente dígitos", '
         '"secao": "número", "zona": "número", "bairro": ""}]}\n'
+        "IMPORTANTE: cada campo pertence à ficha em que aparece — nunca misture telefone, "
+        "título, seção ou zona de uma pessoa com outra. Se uma ficha estiver cortada/incompleta "
+        "na imagem, inclua apenas se tiver ao menos nome E título (senão pule).\n"
         "Telefone: 10-11 dígitos com DDD. Título: 10-12 dígitos, sem pontos. "
         "Se um campo estiver ilegível, devolva string vazia. Não invente valores."
     )
