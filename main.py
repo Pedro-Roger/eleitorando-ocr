@@ -207,6 +207,8 @@ def extract_fields(text):
         if best_q > 0:
             result['nome'] = best_name
 
+    result['nome'] = clean_nome(result['nome']) or result['nome']
+
     # --- passada 5: título como número "nu" (rótulo ilegível) —
     # bloco de 10-14 dígitos com agrupamento por espaços é quase sempre o nº do título
     if not result['titleNumber']:
@@ -294,6 +296,28 @@ def nome_quality(s):
     if valid < 2:  # nome completo tem ao menos nome+sobrenome
         return -1
     return valid * 10 + len(s)
+
+
+# Rótulos que a IA/OCR às vezes cola no começo do nome ("Nome completo: Joao")
+NOME_LABEL_RE = re.compile(
+    r'^\s*(?:nome\s*completo|nome\s*do\s*eleitor[ae]?|nome\s*do\s*cadastrado|nome)'
+    r'\s*:\s*',
+    re.IGNORECASE,
+)
+# "Nome" sem dois-pontos colado ao valor ("Nome SUELY SANTOS") — só remove
+# se o resto for composto só de palavras/pontuação de nome (sem dígitos)
+NOME_BARE_RE = re.compile(r"^\s*Nome\s+(?=[A-ZÀ-ÿ][A-Za-zÀ-ÿ'\s]+$)", re.IGNORECASE)
+
+
+def clean_nome(s):
+    """Remove rótulos ('Nome completo:', 'Nome:', etc.) e sujeira do nome."""
+    s = str(s or '').strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = NOME_LABEL_RE.sub('', s)
+        s = NOME_BARE_RE.sub('', s)
+    return s.strip(' :\t')
 
 
 def main_is_label(t):
@@ -488,6 +512,8 @@ def ai_extract_fields(img, ocr_fields):
         out = {}
         for k in campos_faltando:
             v = str(parsed.get(k, '') or '').strip()
+            if k == 'nome':
+                v = clean_nome(v)
             if v:
                 out[k] = v
         print('[IA] preencheu:', out)
@@ -532,8 +558,9 @@ def ai_extract_list(img):
         "IMPORTANTE: cada campo pertence à ficha em que aparece — nunca misture telefone, "
         "título, seção ou zona de uma pessoa com outra. Se uma ficha estiver cortada/incompleta "
         "na imagem, inclua apenas se tiver ao menos nome E título (senão pule).\n"
+        "No campo 'nome' devolva SOMENTE o nome da pessoa — nunca inclua o rótulo "
+        "('Nome:', 'Nome completo:', 'Endereço' etc.).\n"
         "Telefone: 10-11 dígitos com DDD. Título: 10-12 dígitos, sem pontos. "
-        "Se um campo estiver ilegível, devolva string vazia. Não invente valores."
     )
 
     body = _json.dumps({
@@ -570,7 +597,7 @@ def ai_extract_list(img):
             if not isinstance(v, dict):
                 continue
             item = {
-                'nome': str(v.get('nome', '') or '').strip(),
+                'nome': clean_nome(v.get('nome')),
                 'telefone': _clean_num(v.get('telefone')),
                 'titleNumber': _clean_num(v.get('titleNumber')),
                 'secao': _clean_num(v.get('secao')),
