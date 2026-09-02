@@ -5,9 +5,11 @@ import base64
 import asyncio
 import unicodedata
 import urllib.request
+import urllib.error
 import json as _json
 import uuid as _uuid
 import numpy as np
+from dataclasses import dataclass, asdict
 from fastapi import FastAPI, UploadFile, File
 import easyocr
 import psycopg2
@@ -62,7 +64,7 @@ def is_noise(line_norm):
 
 
 def extract_fields(text):
-    result = {'nome': '', 'dataNascimento': '', 'titleNumber': '', 'zona': '', 'secao': '', 'municipio': '', 'uf': ''}
+    result = {'nome': '', 'dataNascimento': '', 'gender': '', 'age': '', 'titleNumber': '', 'zona': '', 'secao': '', 'municipio': '', 'uf': ''}
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     norm = [strip_accents(l).upper() for l in lines]
 
@@ -381,6 +383,269 @@ def rank_angles(img, step=9, span=36):
 
 _load_env()
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL', '')
+
+
+def _parse_model_env(raw):
+    models = [m.strip() for m in str(raw or '').split(',') if m.strip()]
+    return models
+
+
+# Default pool uses the names provided by the user. Keep it env-overridable
+# because OpenRouter model IDs can differ from storefront labels.
+OPENROUTER_MODELS = _parse_model_env(os.environ.get(
+    'OPENROUTER_MODELS',
+    ','.join([
+        'minimax/minimax-m3:free',
+        'thinkingmachines/inkling-small:free',
+        'dots-studio/dots-3-note-preview:free',
+    ]),
+))
+MODEL_REQUEST_TIMEOUT_SECONDS = float(os.environ.get('OPENROUTER_TIMEOUT_SECONDS', '60'))
+MODEL_RETRY_LIMIT = int(os.environ.get('OPENROUTER_RETRY_LIMIT', '3'))
+MODEL_COOLDOWN_SECONDS = float(os.environ.get('OPENROUTER_COOLDOWN_SECONDS', '45'))
+
+
+@dataclass
+class ModelSlot:
+    model: str
+    cooldown_until: float = 0.0
+    consecutive_failures: int = 0
+    last_error: str = ''
+
+
+MODEL_SLOTS = [ModelSlot(model=m) for m in OPENROUTER_MODELS]
+
+
+def send_discord_alert(event, details):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    body = _json.dumps({
+        'content': (
+            f"[ocr-service] {event}\n"
+            f"```json\n{_json.dumps(details, ensure_ascii=False, indent=2)[:1600]}\n```"
+        )
+    }).encode()
+    req = urllib.request.Request(
+        DISCORD_WEBHOOK_URL,
+        data=body,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            return
+    except Exception as exc:
+        print(f'[discord] erro ao enviar alerta: {exc!r}', flush=True)
+
+
+def pick_available_slot(slots, now=None):
+    now = time.time() if now is None else now
+    for slot in slots:
+        if slot.cooldown_until <= now:
+            return slot
+    return None
+
+
+def mark_slot_failure(slot, reason, now=None, cooldown_seconds=MODEL_COOLDOWN_SECONDS):
+    now = time.time() if now is None else now
+    slot.cooldown_until = now + cooldown_seconds
+    slot.consecutive_failures += 1
+    slot.last_error = reason
+
+
+def mark_slot_success(slot):
+    slot.cooldown_until = 0.0
+    slot.consecutive_failures = 0
+    slot.last_error = ''
+
+
+def handle_model_exception(slot, exc, now=None):
+    code = getattr(exc, 'code', None)
+    if code == 429:
+        reason = 'http_429'
+        cooldown = max(MODEL_COOLDOWN_SECONDS, 60.0)
+        event = 'provider_rate_limit'
+    elif isinstance(exc, TimeoutError):
+        reason = 'timeout'
+        cooldown = MODEL_COOLDOWN_SECONDS
+        event = 'provider_timeout'
+    else:
+        reason = f'http_{code}' if code else 'provider_error'
+        cooldown = MODEL_COOLDOWN_SECONDS
+        event = 'provider_error'
+    mark_slot_failure(slot, reason, now=now, cooldown_seconds=cooldown)
+    send_discord_alert(event, {'model': slot.model, 'reason': reason, 'code': code})
+    raise exc
+
+
+def _default_review_draft():
+    return {
+        'type': 'titulo',
+        'fields': {
+            'nome': '',
+            'dataNascimento': '',
+            'gender': '',
+            'age': '',
+            'titleNumber': '',
+            'zona': '',
+            'secao': '',
+            'municipio': '',
+            'uf': '',
+        },
+    }
+
+
+def _build_ai_prompt():
+    return (
+        "Analise a imagem e responda APENAS um JSON válido.\n"
+        "Se for um Título de Eleitor individual, retorne:\n"
+        '{"type":"titulo","fields":{"nome":"","dataNascimento":"DD/MM/AAAA","gender":"M ou F (infira pelo nome baseando-se no contexto brasileiro)","titleNumber":"somente dígitos","zona":"número","secao":"número","municipio":"","uf":"sigla"}}\n'
+        "Se for uma lista/caderneta com vários eleitores, retorne:\n"
+        '{"type":"lista","voters":[{"nome":"","telefone":"somente dígitos","titleNumber":"somente dígitos","secao":"número","zona":"número","bairro":"","gender":"M ou F (infira pelo nome baseando-se no contexto brasileiro)"}]}\n'
+        "Não escreva texto extra. Não invente valores além de inferir o gênero pelo nome."
+    )
+
+
+def _extract_json_object(content):
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                text_parts.append(item.get('text', ''))
+        content = '\n'.join(text_parts)
+    m = re.search(r'\{.*\}', str(content or ''), re.DOTALL)
+    if not m:
+        raise ValueError('Resposta sem JSON')
+    return _json.loads(m.group(0))
+
+
+def _normalize_ai_payload(parsed):
+    if parsed.get('type') == 'lista':
+        voters = []
+        for voter in parsed.get('voters', []):
+            if not isinstance(voter, dict):
+                continue
+            
+            gender = str(voter.get('gender') or voter.get('genero') or '').strip().upper()
+            if gender not in ('M', 'F'):
+                gender = ''
+                
+            voters.append({
+                'nome': clean_nome(voter.get('nome')),
+                'telefone': _clean_num(voter.get('telefone')),
+                'titleNumber': _clean_num(voter.get('titleNumber')),
+                'secao': _clean_num(voter.get('secao')),
+                'zona': _clean_num(voter.get('zona')),
+                'bairro': str(voter.get('bairro', '') or '').strip(),
+                'gender': gender,
+                'titleValid': titulo_valido(_clean_num(voter.get('titleNumber')))
+                    if _clean_num(voter.get('titleNumber')) else None,
+            })
+        return {'type': 'lista', 'voters': voters}
+
+    fields = _default_review_draft()['fields']
+    src = parsed.get('fields') if isinstance(parsed.get('fields'), dict) else parsed
+    for key in fields:
+        value = src.get(key, '') if isinstance(src, dict) else ''
+        if key == 'nome':
+            fields[key] = clean_nome(value)
+        elif key in {'titleNumber', 'zona', 'secao'}:
+            fields[key] = _clean_num(value)
+        elif key == 'gender':
+            v = str(value or src.get('genero') or '').strip().upper()
+            fields[key] = v if v in ('M', 'F') else ''
+        elif key == 'age':
+            continue
+        else:
+            fields[key] = str(value or '').strip()
+            
+    # Calcula a idade automaticamente
+    if fields.get('dataNascimento'):
+        try:
+            from datetime import datetime
+            birth = datetime.strptime(fields['dataNascimento'], '%d/%m/%Y')
+            today = datetime.today()
+            fields['age'] = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+        except Exception:
+            fields['age'] = ''
+            
+    return {'type': 'titulo', 'fields': fields}
+
+
+def _encode_image(img):
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def run_model_request(slot, img_b64, prompt):
+    body = _json.dumps({
+        'model': slot.model,
+        'messages': [{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{img_b64}'}},
+            ],
+        }],
+        'max_tokens': 3000,
+    }).encode()
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=body,
+        headers={
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json',
+        },
+    )
+    with urllib.request.urlopen(req, timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as resp:
+        return _json.loads(resp.read())
+
+
+def build_review_payload_from_response(data, slot, latency_ms):
+    content = data['choices'][0]['message']['content']
+    parsed = _extract_json_object(content)
+    normalized = _normalize_ai_payload(parsed)
+    return {
+        'rawResult': parsed,
+        'reviewDraft': normalized,
+        'modelUsed': slot.model,
+        'latencyMs': latency_ms,
+        'slotState': asdict(slot),
+    }
+
+
+def process_image_ai_only(img):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError('OPENROUTER_API_KEY ausente')
+    img_b64 = _encode_image(img)
+    prompt = _build_ai_prompt()
+    last_exc = None
+    for attempt in range(1, MODEL_RETRY_LIMIT + 1):
+        slot = pick_available_slot(MODEL_SLOTS)
+        if slot is None:
+            send_discord_alert('model_pool_exhausted', {'attempt': attempt, 'models': OPENROUTER_MODELS})
+            time.sleep(1)
+            continue
+        started = time.time()
+        try:
+            data = run_model_request(slot, img_b64, prompt)
+            payload = build_review_payload_from_response(data, slot, int((time.time() - started) * 1000))
+            payload['attemptCount'] = attempt
+            mark_slot_success(slot)
+            return payload
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            handle_model_exception(slot, exc)
+        except Exception as exc:
+            last_exc = exc
+            mark_slot_failure(slot, type(exc).__name__)
+            send_discord_alert(
+                'provider_exception',
+                {'model': slot.model, 'attempt': attempt, 'error': repr(exc)[:400]},
+            )
+    raise RuntimeError(f'falha ao processar imagem no pool de IA: {last_exc!r}')
 
 # banco da fila de jobs (mesmo Postgres da aplicação)
 def _sanitize_dsn(dsn):
@@ -412,9 +677,49 @@ def db():
     return psycopg2.connect(DB_DSN)
 
 
+def _decode_job_result(value):
+    if value and isinstance(value, str):
+        try:
+            return _json.loads(value)
+        except Exception:
+            return {'raw': value}
+    return value or {}
+
+
+def fetch_job_row(job_id):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('SELECT * FROM ocr_jobs WHERE id = %s', (job_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def update_job_result_payload(job_id, payload, status=None, error=None):
+    conn = db()
+    cur = conn.cursor()
+    if status is None:
+        cur.execute(
+            'UPDATE ocr_jobs SET result = %s, error = %s WHERE id = %s',
+            (_json.dumps(payload), error, job_id),
+        )
+    else:
+        cur.execute(
+            'UPDATE ocr_jobs SET status = %s, result = %s, error = %s, "finishedAt" = now() WHERE id = %s',
+            (status, _json.dumps(payload), error, job_id),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def mark_job_confirmed(job_id, payload):
+    update_job_result_payload(job_id, payload, status='confirmed')
+
+
 async def ocr_worker():
-    """Consome a fila ocr_jobs: 1 job por vez (EasyOCR é pesado, CPU-bound).
-    Escalar = subir mais réplicas deste serviço — SKIP LOCKED evita duplicação."""
+    """Consome a fila ocr_jobs: 1 job por vez e envia para o pool de IA."""
     while True:
         try:
             conn = db()
@@ -440,28 +745,12 @@ async def ocr_worker():
                 img = Image.open(job['imagePath'])
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                result = await asyncio.to_thread(process_image_full, img)
-                conn = db()
-                cur = conn.cursor()
-                cur.execute(
-                    'UPDATE ocr_jobs SET status = %s, result = %s, "finishedAt" = now() WHERE id = %s',
-                    ('done', _json.dumps(result), job_id),
-                )
-                conn.commit()
-                cur.close()
-                conn.close()
+                result = await asyncio.to_thread(process_image_ai_only, img)
+                update_job_result_payload(job_id, result, status='review_required')
                 print(f'[worker] job {job_id} concluído em {time.time() - started:.0f}s', flush=True)
             except Exception as exc:
                 print(f'[worker] job {job_id} ERRO: {exc!r}', flush=True)
-                conn = db()
-                cur = conn.cursor()
-                cur.execute(
-                    'UPDATE ocr_jobs SET status = %s, error = %s, "finishedAt" = now() WHERE id = %s',
-                    ('error', repr(exc)[:500], job_id),
-                )
-                conn.commit()
-                cur.close()
-                conn.close()
+                update_job_result_payload(job_id, {}, status='error', error=repr(exc)[:500])
         except Exception as exc:
             print(f'[worker] falha no loop: {exc!r}', flush=True)
             await asyncio.sleep(2)
@@ -475,7 +764,7 @@ def ai_extract_fields(img, ocr_fields):
     if not OPENROUTER_API_KEY:
         return {}
 
-    campos_faltando = [k for k in ('nome', 'dataNascimento', 'titleNumber', 'zona', 'secao', 'municipio', 'uf')
+    campos_faltando = [k for k in ('nome', 'dataNascimento', 'gender', 'titleNumber', 'zona', 'secao', 'municipio', 'uf')
                        if not ocr_fields.get(k)]
     if not campos_faltando:
         return {}
@@ -490,10 +779,10 @@ def ai_extract_fields(img, ocr_fields):
         "Leia a imagem com atenção (inclua áreas com selo/marca d'água ou levemente tortas) "
         "e extraia APENAS os campos faltantes.\n"
         "Responda APENAS um JSON válido, sem texto extra, no formato:\n"
-        '{"nome": "", "dataNascimento": "DD/MM/AAAA", "titleNumber": "somente dígitos", '
+        '{"nome": "", "dataNascimento": "DD/MM/AAAA", "gender": "M ou F (infira pelo nome)", "titleNumber": "somente dígitos", '
         '"zona": "número", "secao": "número", "municipio": "", "uf": "sigla com 2 letras"}\n'
         "Se um campo não estiver visível ou não tiver certeza, devolva string vazia para ele.\n"
-        "Não invente valores."
+        "Não invente valores além de inferir o gênero."
     )
 
     body = _json.dumps({
@@ -702,14 +991,14 @@ def process_image_full(img):
                 merged[k] = v
 
     def complete():
-        return all([merged['nome'], merged['titleNumber'], merged['zona'],
-                    merged['secao'], merged['municipio'], merged['uf']])
-
-    def faltando():
-        return [k for k in ('nome', 'dataNascimento', 'titleNumber', 'zona', 'secao', 'municipio', 'uf')
+        return not [k for k in ('nome', 'dataNascimento', 'gender', 'titleNumber', 'zona', 'secao', 'municipio', 'uf')
                 if not merged.get(k)]
 
-    merged = {'nome': '', 'dataNascimento': '', 'titleNumber': '', 'zona': '', 'secao': '', 'municipio': '', 'uf': ''}
+    def faltando():
+        return [k for k in ('nome', 'dataNascimento', 'gender', 'titleNumber', 'zona', 'secao', 'municipio', 'uf')
+                if not merged.get(k)]
+
+    merged = {'nome': '', 'dataNascimento': '', 'gender': '', 'age': '', 'titleNumber': '', 'zona': '', 'secao': '', 'municipio': '', 'uf': ''}
     data_candidates = []
     zona_candidates = []
     secao_candidates = []
@@ -764,7 +1053,7 @@ def process_image_full(img):
                 merged[k] = v
         if ai_fields:
             ai_used = True
-        faltando = [k for k in ('nome', 'dataNascimento', 'titleNumber', 'zona', 'secao', 'municipio', 'uf') if not merged.get(k)]
+        faltando = [k for k in ('nome', 'dataNascimento', 'gender', 'titleNumber', 'zona', 'secao', 'municipio', 'uf') if not merged.get(k)]
         if len(faltando) <= 1:
             return {'fields': merged, 'rawText': best_text, 'aiUsed': ai_used}
 
@@ -807,6 +1096,13 @@ def process_image_full(img):
         melhor = min(data_candidates, key=ano)
         if ano(melhor) <= 2009 or len(data_candidates) == 1:
             merged['dataNascimento'] = melhor
+            try:
+                from datetime import datetime
+                b = datetime.strptime(melhor, '%d/%m/%Y')
+                t = datetime.today()
+                merged['age'] = t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+            except Exception:
+                merged['age'] = ''
 
     # fallback zona: linha nua após o título no melhor texto
     if not merged['zona'] and merged['titleNumber']:
@@ -821,7 +1117,7 @@ def process_image_full(img):
                 break
 
     # === passo 4: IA final para o que ainda faltar ===
-    faltando = [k for k in ('nome', 'dataNascimento', 'titleNumber', 'zona', 'secao', 'municipio', 'uf') if not merged.get(k)]
+    faltando = [k for k in ('nome', 'dataNascimento', 'gender', 'titleNumber', 'zona', 'secao', 'municipio', 'uf') if not merged.get(k)]
     if faltando and OPENROUTER_API_KEY:
         ai_fields = ai_extract_fields(img, merged)
         for k, v in ai_fields.items():
@@ -863,20 +1159,37 @@ async def create_job(file: UploadFile = File(...), createdby: int = 0, createdby
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: int):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('SELECT * FROM ocr_jobs WHERE id = %s', (job_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    row = fetch_job_row(job_id)
     if not row:
         return JSONResponse({'error': 'Job não encontrado.'}, status_code=404)
-    if row.get('result') and isinstance(row['result'], str):
-        try:
-            row['result'] = _json.loads(row['result'])
-        except Exception:
-            pass
+    row['result'] = _decode_job_result(row.get('result'))
     return {'job': row}
+
+
+@app.patch("/jobs/{job_id}/review")
+async def save_review(job_id: int, body: dict):
+    row = fetch_job_row(job_id)
+    if not row:
+        return JSONResponse({'error': 'Job não encontrado.'}, status_code=404)
+    result_payload = _decode_job_result(row.get('result'))
+    result_payload['reviewDraft'] = body.get('reviewDraft') or result_payload.get('reviewDraft') or _default_review_draft()
+    result_payload['reviewUpdatedAt'] = int(time.time())
+    update_job_result_payload(job_id, result_payload, status='review_required')
+    return {'jobId': job_id, 'status': 'review_required'}
+
+
+@app.post("/jobs/{job_id}/confirm")
+async def confirm_job(job_id: int):
+    row = fetch_job_row(job_id)
+    if not row:
+        return JSONResponse({'error': 'Job não encontrado.'}, status_code=404)
+    result_payload = _decode_job_result(row.get('result'))
+    review_draft = result_payload.get('reviewDraft')
+    if not review_draft:
+        return JSONResponse({'error': 'Job sem rascunho revisado.'}, status_code=400)
+    result_payload['confirmedAt'] = int(time.time())
+    mark_job_confirmed(job_id, result_payload)
+    return {'jobId': job_id, 'status': 'confirmed'}
 
 
 @app.get("/jobs")
